@@ -1,0 +1,583 @@
+-- Rondzcakto Auto Boss Script (Dropdown weapons, Key hidden)
+-- Key (internal): rondz1588
+-- HP item name = "băng gạc" (lowercase)
+
+print("[Rondzcakto] Script starting...")
+
+-- Services
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local player = Players.LocalPlayer
+local workspaceRef = workspace
+
+-- Optional VirtualInputManager
+local VirtualInputManager = nil
+pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
+
+-- Load Rayfield UI safely
+local ok, Rayfield = pcall(function()
+    return loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+end)
+if not ok or not Rayfield then
+    warn("[Rondzcakto] Failed to load Rayfield UI. Stopping.")
+    return
+end
+
+-- ======= State / Config =======
+local selectedWeaponName = nil
+local bossName = "Boss"
+
+local autoEquipAndAttack = false
+local attackInterval = 0.12
+
+local orbitEnabled = false
+local orbitDistance = 12
+local orbitSpeed = 2
+
+local autoHP = false
+local hpThreshold = 70
+local healing = false
+
+local antiAFK = false
+local antiAFKConnection = nil
+
+-- Boss cache
+local cachedBoss = nil
+local cacheLastCheck = 0
+local cacheInterval = 2.0
+
+-- HP UI smoothing
+local currentHPPercent = 0
+local currentTweenFake = nil
+
+-- ======= Helpers =======
+
+local function safeActivate(tool)
+    if not tool then return false end
+    local success = pcall(function() tool:Activate() end)
+    if success then return true end
+    success = pcall(function()
+        if tool.Activate then tool.Activate(tool) end
+    end)
+    if success then return true end
+    -- fallback VirtualUser click (best-effort)
+    pcall(function()
+        VirtualUser:Button1Down(Vector2.new(0,0), workspaceRef.CurrentCamera.CFrame)
+        task.wait(0.02)
+        VirtualUser:Button1Up(Vector2.new(0,0), workspaceRef.CurrentCamera.CFrame)
+    end)
+    return false
+end
+
+local function normalize(str)
+    if not str then return "" end
+    return string.lower(string.gsub(tostring(str), "%s+", ""))
+end
+
+-- find tool by exact/partial/case-insensitive name in character/backpack
+local function findToolByName(name)
+    if not name then return nil, nil end
+    local target = name:lower()
+    local char = player.Character
+    if char then
+        for _, v in ipairs(char:GetChildren()) do
+            if v:IsA("Tool") then
+                local vn = tostring(v.Name):lower()
+                if vn == target or vn:find(target, 1, true) then
+                    return v, "char"
+                end
+            end
+        end
+    end
+    if player.Backpack then
+        for _, v in ipairs(player.Backpack:GetChildren()) do
+            if v:IsA("Tool") then
+                local vn = tostring(v.Name):lower()
+                if vn == target or vn:find(target, 1, true) then
+                    return v, "backpack"
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function equipToolFromBackpack(name)
+    if not player then return false end
+    local char = player.Character
+    local bp = player.Backpack
+    if not char or not bp then return false end
+    -- try exact
+    local tool = bp:FindFirstChild(name)
+    if tool and char:FindFirstChildOfClass("Humanoid") then
+        local ok = pcall(function() char.Humanoid:EquipTool(tool) end)
+        return ok
+    end
+    -- case-insensitive search
+    for _, v in ipairs(bp:GetChildren()) do
+        if v:IsA("Tool") and tostring(v.Name):lower() == tostring(name):lower() then
+            local ok = pcall(function() char.Humanoid:EquipTool(v) end)
+            return ok
+        end
+    end
+    return false
+end
+
+local function moveToolToCharacter(name)
+    local bp = player.Backpack
+    local char = player.Character
+    if not bp or not char then return false end
+    local item = bp:FindFirstChild(name)
+    if item then
+        pcall(function() item.Parent = char end)
+        return true
+    end
+    for _, v in ipairs(bp:GetChildren()) do
+        if v:IsA("Tool") and tostring(v.Name):lower() == tostring(name):lower() then
+            pcall(function() v.Parent = char end)
+            return true
+        end
+    end
+    return false
+end
+
+local function refreshBossCache()
+    local now = tick()
+    if cachedBoss and cachedBoss.Parent and cachedBoss:FindFirstChildOfClass("Humanoid") and cachedBoss:FindFirstChild("HumanoidRootPart") then
+        return cachedBoss
+    end
+    if now - cacheLastCheck < cacheInterval then
+        return nil
+    end
+    cacheLastCheck = now
+    local byName = workspaceRef:FindFirstChild(bossName)
+    if byName and byName:IsA("Model") and byName:FindFirstChildOfClass("Humanoid") and byName:FindFirstChild("HumanoidRootPart") then
+        cachedBoss = byName
+        return cachedBoss
+    end
+    for _, v in pairs(workspaceRef:GetDescendants()) do
+        if v:IsA("Model") and v.Name == bossName and v:FindFirstChildOfClass("Humanoid") and v:FindFirstChild("HumanoidRootPart") then
+            cachedBoss = v
+            return cachedBoss
+        end
+    end
+    cachedBoss = nil
+    return nil
+end
+
+local function tweenHPTo(percent, bossHPBar)
+    percent = math.clamp(percent, 0, 100)
+    if currentTweenFake then
+        pcall(function() currentTweenFake:Destroy() end)
+        currentTweenFake = nil
+    end
+    local fake = Instance.new("NumberValue")
+    fake.Value = currentHPPercent
+    currentTweenFake = fake
+    local ok, tween = pcall(function()
+        return TweenService:Create(fake, TweenInfo.new(0.36, Enum.EasingStyle.Linear), {Value = percent})
+    end)
+    if ok and tween then
+        fake.Changed:Connect(function(val)
+            pcall(function() bossHPBar:Set(math.floor(val)) end)
+        end)
+        tween:Play()
+        tween.Completed:Wait()
+        currentHPPercent = percent
+        pcall(function() fake:Destroy() end)
+        currentTweenFake = nil
+    else
+        pcall(function() bossHPBar:Set(math.floor(percent)) end)
+        currentHPPercent = percent
+        pcall(function() fake:Destroy() end)
+        currentTweenFake = nil
+    end
+end
+
+-- ======= UI & KeySystem =======
+local Window = Rayfield:CreateWindow({
+    Name = "Rondzcakto",
+    LoadingTitle = "Đang tải...",
+    LoadingSubtitle = "Executor: Solara PC",
+    ConfigurationSaving = { Enabled = false },
+    Theme = "Light",
+    KeySystem = true,
+    KeySettings = {
+        Title = "Rondzcakto - Key System",
+        Subtitle = "Nhập key để tiếp tục",
+        -- Note intentionally removed to avoid leaking key
+        FileName = "RondzKeyConfig",
+        SaveKey = false,
+        GrabKeyFromSite = false,
+        Key = {"rondz1588"},
+        Callback = function(correctKey)
+            if correctKey then
+                Rayfield:Notify({
+                    Title = "✅ Thành công",
+                    Content = "Key đúng! Menu đã được mở.",
+                    Duration = 3
+                })
+            else
+                Rayfield:Notify({
+                    Title = "❌ Sai Key",
+                    Content = "Key sai. Vui lòng thử lại.",
+                    Duration = 3
+                })
+            end
+        end
+    }
+})
+
+-- Toggle UI with V
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.V then Window:Toggle() end
+end)
+
+-- Tabs
+local FarmBossTab = Window:CreateTab("⚔️ Farm Boss", 4483362458)
+local FarmMoneyTab = Window:CreateTab("🤑 Farm Tiền", 4483362458)
+
+-- Weapons dropdown & refresh
+local function getWeaponList()
+    local t = {}
+    -- list tools from Backpack (prefer Backpack)
+    if player and player.Backpack then
+        for _, v in ipairs(player.Backpack:GetChildren()) do
+            if v:IsA("Tool") then
+                table.insert(t, v.Name)
+            end
+        end
+    end
+    -- also include equipped tools in character (if any)
+    if player and player.Character then
+        for _, v in ipairs(player.Character:GetChildren()) do
+            if v:IsA("Tool") then
+                local found = false
+                for _, name in ipairs(t) do if name == v.Name then found = true break end end
+                if not found then table.insert(t, v.Name) end
+            end
+        end
+    end
+    -- sort for stable order
+    table.sort(t)
+    return t
+end
+
+-- Create dropdown (initial)
+local weaponOptions = getWeaponList()
+local weaponDropdown = FarmBossTab:CreateDropdown({
+    Name = "Chọn Vũ Khí (Backpack)",
+    Options = weaponOptions,
+    CurrentOption = weaponOptions[1] and {weaponOptions[1]} or {},
+    Flag = "WeaponDropdown",
+    Callback = function(option)
+        -- option is a table of selected options from Rayfield dropdown; pick first
+        if type(option) == "table" then
+            selectedWeaponName = option[1]
+        else
+            selectedWeaponName = option
+        end
+        if selectedWeaponName then
+            Rayfield:Notify({Title = "Vũ khí", Content = "Đã chọn: "..tostring(selectedWeaponName), Duration = 2})
+        end
+    end
+})
+
+-- If Rayfield's dropdown returned a single-string instead of table, ensure selectedWeaponName set
+if weaponOptions[1] then selectedWeaponName = weaponOptions[1] end
+
+-- Refresh button (update options)
+FarmBossTab:CreateButton({
+    Name = "🔄 Làm mới danh sách vũ khí",
+    Callback = function()
+        local newList = getWeaponList()
+        -- attempt to update dropdown; Rayfield dropdown usually has :Set or :Refresh method.
+        -- We'll try common APIs and fallback to re-create the dropdown (best-effort).
+        local succeeded = false
+        pcall(function()
+            if weaponDropdown.Set then weaponDropdown:Set(newList); succeeded = true end
+            if weaponDropdown.UpdateOptions then weaponDropdown:UpdateOptions(newList); succeeded = true end
+            if weaponDropdown.Refresh then weaponDropdown:Refresh(newList); succeeded = true end
+        end)
+        if not succeeded then
+            -- fallback: notify user to re-open UI (still updated internal list)
+            Rayfield:Notify({Title="Refresh", Content="Danh sách vũ khí đã cập nhật nội bộ. Nếu dropdown không đổi, mở lại menu.", Duration=3})
+        else
+            Rayfield:Notify({Title="Refresh", Content="Danh sách vũ khí đã cập nhật.", Duration=2})
+        end
+        -- set default selectedWeaponName if available
+        if #newList > 0 then selectedWeaponName = newList[1] end
+    end
+})
+
+-- Boss name input
+FarmBossTab:CreateInput({
+    Name = "🧟 Tên Boss (chính xác)",
+    PlaceholderText = "VD: Boss",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        if text and text ~= "" then
+            bossName = text
+            cachedBoss = nil
+        end
+    end
+})
+
+-- Auto Equip + Attack toggle
+FarmBossTab:CreateToggle({
+    Name = "⚔ Auto Equip + Auto Attack",
+    CurrentValue = false,
+    Callback = function(state) autoEquipAndAttack = state end
+})
+
+FarmBossTab:CreateInput({
+    Name = "⏱ Khoảng cách giữa đòn (giây)",
+    PlaceholderText = "VD: 0.12",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        local n = tonumber(text)
+        if n and n > 0 then attackInterval = n end
+    end
+})
+
+-- Orbit controls
+FarmBossTab:CreateToggle({
+    Name = "🌀 Quay quanh Boss (mặt đất)",
+    CurrentValue = false,
+    Callback = function(state) orbitEnabled = state end
+})
+
+FarmBossTab:CreateInput({
+    Name = "📏 Khoảng cách Orbit (studs)",
+    PlaceholderText = "VD: 12",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) local n = tonumber(text) if n and n >= 0 then orbitDistance = n end end
+})
+
+FarmBossTab:CreateInput({
+    Name = "⚡ Tốc độ Orbit",
+    PlaceholderText = "VD: 2",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) local n = tonumber(text) if n and n > 0 then orbitSpeed = n end end
+})
+
+-- Auto HP controls
+FarmBossTab:CreateToggle({
+    Name = "❤️ Auto HP (băng gạc)",
+    CurrentValue = false,
+    Callback = function(state) autoHP = state end
+})
+
+FarmBossTab:CreateInput({
+    Name = "Ngưỡng máu sử dụng HP (<=)",
+    PlaceholderText = "VD: 70",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) local n = tonumber(text) if n then hpThreshold = n end end
+})
+
+-- Status & Boss HP UI
+local statusLabel = FarmBossTab:CreateLabel("Trạng thái: Idle")
+local bossHPBar = FarmBossTab:CreateSlider({
+    Name = "❤️ Boss HP",
+    Range = {0,100},
+    Increment = 1,
+    Suffix = "%",
+    CurrentValue = 0,
+    Callback = function() end
+})
+local bossHPLabel = FarmBossTab:CreateLabel("HP: 0 / 0")
+local bossHPState = FarmBossTab:CreateLabel("⬛ Boss HP: Không tìm thấy")
+
+-- Farm Tiền (Anti AFK)
+FarmMoneyTab:CreateToggle({
+    Name = "💤 Anti AFK",
+    CurrentValue = false,
+    Callback = function(state)
+        antiAFK = state
+        if antiAFK then
+            if antiAFKConnection then antiAFKConnection:Disconnect(); antiAFKConnection = nil end
+            antiAFKConnection = player.Idled:Connect(function()
+                pcall(function()
+                    VirtualUser:Button2Down(Vector2.new(0,0), workspaceRef.CurrentCamera.CFrame)
+                    task.wait(1)
+                    VirtualUser:Button2Up(Vector2.new(0,0), workspaceRef.CurrentCamera.CFrame)
+                end)
+            end)
+            Rayfield:Notify({Title = "Anti AFK", Content = "Đã bật Anti AFK", Duration = 2})
+        else
+            if antiAFKConnection then antiAFKConnection:Disconnect(); antiAFKConnection = nil end
+            Rayfield:Notify({Title = "Anti AFK", Content = "Đã tắt Anti AFK", Duration = 2})
+        end
+    end
+})
+
+-- ======= Auto HP (non-blocking) =======
+local function tryHealAsync()
+    if healing then return end
+    healing = true
+    task.spawn(function()
+        local char = player.Character
+        if not char or not char:FindFirstChildOfClass("Humanoid") then
+            healing = false
+            return
+        end
+        -- check if player still wants autoHP
+        if not autoHP then healing = false return end
+
+        -- Try to find băng gạc (lowercase) in char or backpack
+        local bandage, where = findToolByName("băng gạc")
+        if bandage and where == "backpack" then
+            -- equip safely
+            local ok = pcall(function() char.Humanoid:EquipTool(bandage) end)
+            if not ok then
+                -- fallback move then equip
+                pcall(function() bandage.Parent = char end)
+            end
+            task.wait(0.12)
+            bandage = char:FindFirstChild("băng gạc") or char:FindFirstChildOfClass("Tool")
+        end
+
+        if bandage then
+            statusLabel:Set("Trạng thái: Đang dùng băng gạc")
+            pcall(function() safeActivate(bandage) end)
+            task.wait(1.4)
+            -- after healing, try re-equip selected weapon (non-blocking)
+            if selectedWeaponName and player and player.Character and player.Backpack then
+                pcall(function()
+                    -- try exact
+                    local bp = player.Backpack
+                    if bp:FindFirstChild(selectedWeaponName) then
+                        player.Character.Humanoid:EquipTool(bp:FindFirstChild(selectedWeaponName))
+                    else
+                        -- case-insensitive attempt
+                        for _, v in ipairs(bp:GetChildren()) do
+                            if v:IsA("Tool") and tostring(v.Name):lower() == tostring(selectedWeaponName):lower() then
+                                player.Character.Humanoid:EquipTool(v)
+                                break
+                            end
+                        end
+                    end
+                end)
+            end
+        else
+            statusLabel:Set("Trạng thái: Không tìm thấy băng gạc")
+            task.wait(0.😎
+        end
+
+        healing = false
+        statusLabel:Set("Trạng thái: Idle")
+    end)
+end
+
+-- ======= Main loop =======
+local baseStep = 0.10
+local attackTicker, orbitTicker, bossScanTicker, hpTicker = 0,0,0,0
+
+task.spawn(function()
+    while true do
+        local t0 = tick()
+
+        -- refresh boss cache occasionally
+        bossScanTicker = bossScanTicker + baseStep
+        if bossScanTicker >= cacheInterval then
+            bossScanTicker = 0
+            refreshBossCache()
+        end
+
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+        -- AutoHeal trigger (non-blocking)
+        hpTicker = hpTicker + baseStep
+        if hpTicker >= 0.25 then
+            hpTicker = 0
+            if autoHP and char and hum then
+                local hpPercent = (hum.Health / (hum.MaxHealth > 0 and hum.MaxHealth or 1)) * 100
+                if hpPercent <= hpThreshold and not healing then
+                    tryHealAsync()
+                end
+            end
+        end
+
+        -- Auto Equip & Attack (skip while healing)
+        attackTicker = attackTicker + baseStep
+        if attackTicker >= attackInterval then
+            attackTicker = 0
+            if autoEquipAndAttack and char and hum and not healing and selectedWeaponName then
+                local tool, where = findToolByName(selectedWeaponName)
+                if tool then
+                    if where == "backpack" then
+                        local ok = pcall(function() char.Humanoid:EquipTool(tool) end)
+                        if ok then
+                            statusLabel:Set("Trạng thái: Đã equip '"..tostring(tool.Name).."'")
+                            task.wait(0.06)
+                        else
+                            moveToolToCharacter(tool.Name)
+                            task.wait(0.08)
+                            statusLabel:Set("Trạng thái: Di chuyển '"..tostring(tool.Name).."' sang char")
+                        end
+                        tool = char:FindFirstChildOfClass("Tool")
+                    else
+                        statusLabel:Set("Trạng thái: Đang cầm '"..tostring(tool.Name).."'")
+                    end
+
+                    -- activate attack
+                    local okAct = pcall(function() safeActivate(tool) end)
+                    if okAct then
+                        statusLabel:Set("Trạng thái: Tấn công bằng '"..tostring(tool.Name).."'")
+                    else
+                        statusLabel:Set("Trạng thái: Không thể tấn công bằng '"..tostring(tool.Name).."'")
+                    end
+                else
+                    statusLabel:Set("Trạng thái: Không tìm thấy vũ khí '"..tostring(selectedWeaponName).."'")
+                end
+            end
+        end
+
+        -- Orbit (continues even when healing)
+        orbitTicker = orbitTicker + baseStep
+        if orbitTicker >= 0.08 then
+            orbitTicker = 0
+            if orbitEnabled and hrp then
+                local boss = refreshBossCache() or cachedBoss
+                if boss and boss:FindFirstChild("HumanoidRootPart") then
+                    local bossPos = boss.HumanoidRootPart.Position
+                    local angle = tick() * orbitSpeed
+                    local newPos = bossPos + Vector3.new(math.cos(angle) * orbitDistance, 0, math.sin(angle) * orbitDistance)
+                    pcall(function() hrp.CFrame = CFrame.new(newPos, bossPos) end)
+                end
+            end
+        end
+
+        -- Boss HP UI update
+        local boss = cachedBoss or refreshBossCache()
+        if boss and boss:FindFirstChildOfClass("Humanoid") then
+            local bh = boss:FindFirstChildOfClass("Humanoid")
+            local targetPercent = 0
+            if bh.MaxHealth and bh.MaxHealth > 0 then targetPercent = math.clamp((bh.Health / bh.MaxHealth) * 100, 0, 100) end
+            if math.abs(targetPercent - currentHPPercent) > 0.5 then
+                task.spawn(function() tweenHPTo(targetPercent, bossHPBar) end)
+            end
+            bossHPLabel:Set("HP: " .. math.floor(bh.Health) .. " / " .. math.floor(bh.MaxHealth))
+            if targetPercent > 70 then bossHPState:Set("🟩 Boss HP: Tốt")
+            elseif targetPercent > 30 then bossHPState:Set("🟨 Boss HP: Trung bình")
+            else bossHPState:Set("🟥 Boss HP: Nguy hiểm") end
+        else
+            if currentHPPercent ~= 0 then task.spawn(function() tweenHPTo(0, bossHPBar) end) end
+            bossHPLabel:Set("HP: 0 / 0")
+            bossHPState:Set("⬛ Boss HP: Không tìm thấy")
+        end
+
+        local t1 = tick()
+        local dt = t1 - t0
+        if dt < baseStep then task.wait(baseStep - dt) end
+    end
+end)
+
+Rayfield:LoadConfiguration()
+print("[Rondzcakto] Script loaded. Press V to toggle UI.")
